@@ -37,7 +37,6 @@
 (define-map patent-licensing uint {licensee: principal, terms: (string-utf8 200), expiry: uint, active: bool})
 (define-map patent-collaborators uint (list 10 {collaborator: principal, share: uint, joined-at: uint}))
 (define-map collaboration-votes uint {proposal-type: (string-utf8 20), votes-for: uint, votes-against: uint, total-collaborators: uint, expires-at: uint, executed: bool})
-(define-map collaborator-exists {patent-id: uint, collaborator: principal} bool)
 
 (define-read-only (get-last-token-id)
   (ok (var-get patent-counter))
@@ -84,7 +83,9 @@
 )
 
 (define-read-only (is-collaborator (patent-id uint) (user principal))
-  (default-to false (map-get? collaborator-exists {patent-id: patent-id, collaborator: user}))
+  (let ((collaborators (get-patent-collaborators patent-id)))
+    (> (len (filter (lambda (c) (is-eq (get collaborator c) user)) collaborators)) u0)
+  )
 )
 
 (define-read-only (verify-patent-timestamp (patent-id uint) (claimed-timestamp uint))
@@ -163,97 +164,6 @@
     
     (var-set patent-counter patent-id)
     (ok patent-id)
-  )
-)
-
-(define-public (add-collaborator (patent-id uint) (collaborator principal) (share uint))
-  (let (
-    (metadata (unwrap! (get-patent-metadata patent-id) ERR_NOT_FOUND))
-    (current-collaborators (get-patent-collaborators patent-id))
-  )
-    (asserts! (is-eq tx-sender (get inventor metadata)) ERR_NOT_AUTHORIZED)
-    (asserts! (not (is-collaborator patent-id collaborator)) ERR_ALREADY_COLLABORATOR)
-    (asserts! (> share u0) ERR_INVALID_INPUT)
-    (asserts! (<= share u100) ERR_INVALID_INPUT)
-    
-    (let ((new-collaborator {collaborator: collaborator, share: share, joined-at: stacks-block-height}))
-      (map-set patent-collaborators patent-id 
-        (unwrap! (as-max-len? (append current-collaborators new-collaborator) u10) ERR_TRANSFER_FAILED))
-      (map-set collaborator-exists {patent-id: patent-id, collaborator: collaborator} true)
-    )
-    (ok true)
-  )
-)
-
-(define-public (remove-collaborator (patent-id uint) (collaborator principal))
-  (let (
-    (metadata (unwrap! (get-patent-metadata patent-id) ERR_NOT_FOUND))
-  )
-    (asserts! (is-eq tx-sender (get inventor metadata)) ERR_NOT_AUTHORIZED)
-    (asserts! (is-collaborator patent-id collaborator) ERR_NOT_COLLABORATOR)
-    
-    (map-delete collaborator-exists {patent-id: patent-id, collaborator: collaborator})
-    (ok true)
-  )
-)
-
-(define-public (start-collaboration-vote (patent-id uint) (proposal-type (string-utf8 20)) (duration uint))
-  (let (
-    (metadata (unwrap! (get-patent-metadata patent-id) ERR_NOT_FOUND))
-    (collaborators (get-patent-collaborators patent-id))
-    (total-collabs (+ (len collaborators) u1))
-  )
-    (asserts! (or (is-eq tx-sender (get inventor metadata)) (is-collaborator patent-id tx-sender)) ERR_NOT_AUTHORIZED)
-    (asserts! (is-none (get-collaboration-vote patent-id)) ERR_ALREADY_EXISTS)
-    (asserts! (> duration u0) ERR_INVALID_INPUT)
-    
-    (map-set collaboration-votes patent-id {
-      proposal-type: proposal-type,
-      votes-for: u0,
-      votes-against: u0,
-      total-collaborators: total-collabs,
-      expires-at: (+ stacks-block-height duration),
-      executed: false
-    })
-    (ok true)
-  )
-)
-
-(define-public (cast-collaboration-vote (patent-id uint) (vote-for bool))
-  (let (
-    (metadata (unwrap! (get-patent-metadata patent-id) ERR_NOT_FOUND))
-    (vote-data (unwrap! (get-collaboration-vote patent-id) ERR_NOT_FOUND))
-  )
-    (asserts! (or (is-eq tx-sender (get inventor metadata)) (is-collaborator patent-id tx-sender)) ERR_NOT_COLLABORATOR)
-    (asserts! (< stacks-block-height (get expires-at vote-data)) ERR_INVALID_INPUT)
-    (asserts! (not (get executed vote-data)) ERR_ALREADY_EXISTS)
-    
-    (let (
-      (new-votes-for (if vote-for (+ (get votes-for vote-data) u1) (get votes-for vote-data)))
-      (new-votes-against (if vote-for (get votes-against vote-data) (+ (get votes-against vote-data) u1)))
-    )
-      (map-set collaboration-votes patent-id (merge vote-data {
-        votes-for: new-votes-for,
-        votes-against: new-votes-against
-      }))
-    )
-    (ok true)
-  )
-)
-
-(define-public (execute-collaboration-vote (patent-id uint))
-  (let (
-    (vote-data (unwrap! (get-collaboration-vote patent-id) ERR_NOT_FOUND))
-    (votes-for (get votes-for vote-data))
-    (total-collabs (get total-collaborators vote-data))
-    (majority-threshold (/ (+ total-collabs u1) u2))
-  )
-    (asserts! (>= stacks-block-height (get expires-at vote-data)) ERR_INVALID_INPUT)
-    (asserts! (not (get executed vote-data)) ERR_ALREADY_EXISTS)
-    (asserts! (>= votes-for majority-threshold) ERR_INSUFFICIENT_VOTES)
-    
-    (map-set collaboration-votes patent-id (merge vote-data {executed: true}))
-    (ok true)
   )
 )
 
@@ -354,6 +264,99 @@
       )
       (ok false)
     )
+  )
+)
+
+(define-public (add-collaborator (patent-id uint) (collaborator principal) (share uint))
+  (let (
+    (metadata (unwrap! (get-patent-metadata patent-id) ERR_NOT_FOUND))
+    (current-collaborators (get-patent-collaborators patent-id))
+    (is-existing (> (len (filter (lambda (c) (is-eq (get collaborator c) collaborator)) current-collaborators)) u0))
+  )
+    (asserts! (is-eq tx-sender (get inventor metadata)) ERR_NOT_AUTHORIZED)
+    (asserts! (not is-existing) ERR_ALREADY_COLLABORATOR)
+    (asserts! (> share u0) ERR_INVALID_INPUT)
+    (asserts! (<= share u100) ERR_INVALID_INPUT)
+    
+    (let ((new-collaborator {collaborator: collaborator, share: share, joined-at: stacks-block-height}))
+      (map-set patent-collaborators patent-id 
+        (unwrap! (as-max-len? (append current-collaborators new-collaborator) u10) ERR_TRANSFER_FAILED))
+    )
+    (ok true)
+  )
+)
+
+(define-public (remove-collaborator (patent-id uint) (collaborator principal))
+  (let (
+    (metadata (unwrap! (get-patent-metadata patent-id) ERR_NOT_FOUND))
+    (current-collaborators (get-patent-collaborators patent-id))
+  )
+    (asserts! (is-eq tx-sender (get inventor metadata)) ERR_NOT_AUTHORIZED)
+    
+    (let ((updated-collaborators (filter (lambda (c) (not (is-eq (get collaborator c) collaborator))) current-collaborators)))
+      (map-set patent-collaborators patent-id updated-collaborators)
+    )
+    (ok true)
+  )
+)
+
+(define-public (start-collaboration-vote (patent-id uint) (proposal-type (string-utf8 20)) (duration uint))
+  (let (
+    (metadata (unwrap! (get-patent-metadata patent-id) ERR_NOT_FOUND))
+    (collaborators (get-patent-collaborators patent-id))
+    (total-collabs (+ (len collaborators) u1))
+  )
+    (asserts! (or (is-eq tx-sender (get inventor metadata)) (is-collaborator patent-id tx-sender)) ERR_NOT_AUTHORIZED)
+    (asserts! (is-none (get-collaboration-vote patent-id)) ERR_ALREADY_EXISTS)
+    (asserts! (> duration u0) ERR_INVALID_INPUT)
+    
+    (map-set collaboration-votes patent-id {
+      proposal-type: proposal-type,
+      votes-for: u0,
+      votes-against: u0,
+      total-collaborators: total-collabs,
+      expires-at: (+ stacks-block-height duration),
+      executed: false
+    })
+    (ok true)
+  )
+)
+
+(define-public (cast-collaboration-vote (patent-id uint) (vote-for bool))
+  (let (
+    (metadata (unwrap! (get-patent-metadata patent-id) ERR_NOT_FOUND))
+    (vote-data (unwrap! (get-collaboration-vote patent-id) ERR_NOT_FOUND))
+  )
+    (asserts! (or (is-eq tx-sender (get inventor metadata)) (is-collaborator patent-id tx-sender)) ERR_NOT_COLLABORATOR)
+    (asserts! (< stacks-block-height (get expires-at vote-data)) ERR_INVALID_INPUT)
+    (asserts! (not (get executed vote-data)) ERR_ALREADY_EXISTS)
+    
+    (let (
+      (new-votes-for (if vote-for (+ (get votes-for vote-data) u1) (get votes-for vote-data)))
+      (new-votes-against (if vote-for (get votes-against vote-data) (+ (get votes-against vote-data) u1)))
+    )
+      (map-set collaboration-votes patent-id (merge vote-data {
+        votes-for: new-votes-for,
+        votes-against: new-votes-against
+      }))
+    )
+    (ok true)
+  )
+)
+
+(define-public (execute-collaboration-vote (patent-id uint))
+  (let (
+    (vote-data (unwrap! (get-collaboration-vote patent-id) ERR_NOT_FOUND))
+    (votes-for (get votes-for vote-data))
+    (total-collabs (get total-collaborators vote-data))
+    (majority-threshold (/ (+ total-collabs u1) u2))
+  )
+    (asserts! (>= stacks-block-height (get expires-at vote-data)) ERR_INVALID_INPUT)
+    (asserts! (not (get executed vote-data)) ERR_ALREADY_EXISTS)
+    (asserts! (>= votes-for majority-threshold) ERR_INSUFFICIENT_VOTES)
+    
+    (map-set collaboration-votes patent-id (merge vote-data {executed: true}))
+    (ok true)
   )
 )
 
