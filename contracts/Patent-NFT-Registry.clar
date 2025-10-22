@@ -9,9 +9,17 @@
 (define-constant ERR_INSUFFICIENT_VOTES (err u501))
 (define-constant ERR_ALREADY_COLLABORATOR (err u502))
 (define-constant ERR_NOT_COLLABORATOR (err u503))
+(define-constant ERR_PATENT_EXPIRED (err u504))
+(define-constant ERR_INSUFFICIENT_PAYMENT (err u505))
+(define-constant ERR_ALREADY_RENEWED (err u506))
+(define-constant ERR_GRACE_PERIOD_EXPIRED (err u507))
+(define-constant ERR_INVALID_RENEWAL_PERIOD (err u508))
 
 (define-data-var patent-counter uint u0)
 (define-data-var contract-uri (optional (string-utf8 256)) none)
+(define-data-var default-validity-period uint u52560)
+(define-data-var base-renewal-fee uint u1000000)
+(define-data-var grace-period uint u5256)
 
 (define-map patent-metadata 
   uint 
@@ -38,6 +46,9 @@
 (define-map patent-collaborators uint (list 10 {collaborator: principal, share: uint, joined-at: uint}))
 (define-map collaboration-votes uint {proposal-type: (string-utf8 20), votes-for: uint, votes-against: uint, total-collaborators: uint, expires-at: uint, executed: bool})
 (define-map collaborator-exists {patent-id: uint, collaborator: principal} bool)
+(define-map patent-renewal uint {expiry-height: uint, renewals-count: uint, last-renewed: uint})
+(define-map patent-validity-periods uint uint)
+(define-map renewal-history uint (list 10 {renewal-height: uint, paid-fee: uint, extended-to: uint}))
 
 (define-read-only (get-last-token-id)
   (ok (var-get patent-counter))
@@ -162,6 +173,13 @@
     )
     
     (var-set patent-counter patent-id)
+    
+    (map-set patent-renewal patent-id {
+      expiry-height: (+ current-timestamp (var-get default-validity-period)),
+      renewals-count: u0,
+      last-renewed: current-timestamp
+    })
+    
     (ok patent-id)
   )
 )
@@ -286,6 +304,7 @@
     (asserts! (is-eq tx-sender sender) ERR_NOT_AUTHORIZED)
     (asserts! (is-eq sender owner) ERR_NOT_AUTHORIZED)
     (asserts! (not (is-eq sender recipient)) ERR_INVALID_INPUT)
+    (asserts! (not (unwrap! (is-patent-expired patent-id) ERR_TRANSFER_FAILED)) ERR_PATENT_EXPIRED)
     
     (try! (nft-transfer? patent-nft patent-id sender recipient))
     (map-set patent-ownership patent-id recipient)
@@ -389,4 +408,127 @@
 
 (define-read-only (get-total-patents)
   (var-get patent-counter)
+)
+
+(define-read-only (get-patent-expiration (patent-id uint))
+  (match (map-get? patent-renewal patent-id)
+    renewal-data (ok (some (get expiry-height renewal-data)))
+    (ok none)
+  )
+)
+
+(define-read-only (is-patent-expired (patent-id uint))
+  (match (map-get? patent-renewal patent-id)
+    renewal-data 
+    (ok (>= stacks-block-height (get expiry-height renewal-data)))
+    (ok false)
+  )
+)
+
+(define-read-only (is-in-grace-period (patent-id uint))
+  (match (map-get? patent-renewal patent-id)
+    renewal-data 
+    (let ((expiry-height (get expiry-height renewal-data))
+          (grace-end (+ expiry-height (var-get grace-period))))
+      (ok (and (>= stacks-block-height expiry-height) 
+               (< stacks-block-height grace-end)))
+    )
+    (ok false)
+  )
+)
+
+(define-read-only (calculate-renewal-fee (patent-id uint))
+  (match (map-get? patent-renewal patent-id)
+    renewal-data 
+    (let ((base-fee (var-get base-renewal-fee))
+          (renewals-count (get renewals-count renewal-data))
+          (multiplier (+ u1 (* renewals-count u1)))
+          (expiry-height (get expiry-height renewal-data))
+          (is-expired (>= stacks-block-height expiry-height))
+          (late-penalty (if is-expired u500000 u0)))
+      (ok (+ (* base-fee multiplier) late-penalty))
+    )
+    (ok (var-get base-renewal-fee))
+  )
+)
+
+(define-read-only (get-renewal-history (patent-id uint))
+  (default-to (list) (map-get? renewal-history patent-id))
+)
+
+(define-public (set-patent-validity-period (patent-id uint) (validity-period uint))
+  (let ((owner (unwrap! (unwrap! (get-owner patent-id) ERR_NOT_FOUND) ERR_NOT_FOUND)))
+    (asserts! (is-eq tx-sender owner) ERR_NOT_AUTHORIZED)
+    (asserts! (> validity-period u0) ERR_INVALID_RENEWAL_PERIOD)
+    (asserts! (is-none (map-get? patent-renewal patent-id)) ERR_ALREADY_EXISTS)
+    
+    (map-set patent-validity-periods patent-id validity-period)
+    (map-set patent-renewal patent-id {
+      expiry-height: (+ stacks-block-height validity-period),
+      renewals-count: u0,
+      last-renewed: stacks-block-height
+    })
+    (ok true)
+  )
+)
+
+(define-public (renew-patent (patent-id uint))
+  (let (
+    (owner (unwrap! (unwrap! (get-owner patent-id) ERR_NOT_FOUND) ERR_NOT_FOUND))
+    (renewal-data (unwrap! (map-get? patent-renewal patent-id) ERR_NOT_FOUND))
+    (required-fee (unwrap! (calculate-renewal-fee patent-id) ERR_TRANSFER_FAILED))
+    (expiry-height (get expiry-height renewal-data))
+    (grace-end (+ expiry-height (var-get grace-period)))
+    (validity-period (default-to (var-get default-validity-period) (map-get? patent-validity-periods patent-id)))
+    (current-history (get-renewal-history patent-id))
+  )
+    (asserts! (is-eq tx-sender owner) ERR_NOT_AUTHORIZED)
+    (asserts! (< stacks-block-height grace-end) ERR_GRACE_PERIOD_EXPIRED)
+    
+    (try! (stx-transfer? required-fee tx-sender CONTRACT_OWNER))
+    
+    (let (
+      (new-expiry (+ stacks-block-height validity-period))
+      (updated-renewals (+ (get renewals-count renewal-data) u1))
+      (renewal-record {renewal-height: stacks-block-height, paid-fee: required-fee, extended-to: new-expiry})
+    )
+      (map-set patent-renewal patent-id {
+        expiry-height: new-expiry,
+        renewals-count: updated-renewals,
+        last-renewed: stacks-block-height
+      })
+      
+      (map-set renewal-history patent-id 
+        (unwrap! (as-max-len? (append current-history renewal-record) u10) ERR_TRANSFER_FAILED))
+      
+      (ok true)
+    )
+  )
+)
+
+(define-public (set-renewal-fee (new-fee uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+    (asserts! (> new-fee u0) ERR_INVALID_INPUT)
+    (var-set base-renewal-fee new-fee)
+    (ok true)
+  )
+)
+
+(define-public (set-grace-period (new-period uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+    (asserts! (> new-period u0) ERR_INVALID_INPUT)
+    (var-set grace-period new-period)
+    (ok true)
+  )
+)
+
+(define-public (set-default-validity-period (new-period uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+    (asserts! (> new-period u0) ERR_INVALID_RENEWAL_PERIOD)
+    (var-set default-validity-period new-period)
+    (ok true)
+  )
 )
