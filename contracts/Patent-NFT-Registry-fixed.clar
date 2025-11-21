@@ -9,7 +9,10 @@
 (define-constant ERR_INSUFFICIENT_VOTES (err u501))
 (define-constant ERR_ALREADY_COLLABORATOR (err u502))
 (define-constant ERR_NOT_COLLABORATOR (err u503))
+(define-constant ERR_NOT_EXPIRED (err u504))
+(define-constant ERR_EXPIRED (err u505))
 
+(define-constant DEFAULT_RENEWAL_TERM u525600)
 (define-data-var patent-counter uint u0)
 (define-data-var contract-uri (optional (string-utf8 256)) none)
 
@@ -38,7 +41,7 @@
 (define-map patent-collaborators uint (list 10 {collaborator: principal, share: uint, joined-at: uint}))
 (define-map collaboration-votes uint {proposal-type: (string-utf8 20), votes-for: uint, votes-against: uint, total-collaborators: uint, expires-at: uint, executed: bool})
 (define-map collaborator-exists {patent-id: uint, collaborator: principal} bool)
-
+(define-map patent-renewals uint {expiry: uint, renewals: uint})
 (define-read-only (get-last-token-id)
   (ok (var-get patent-counter))
 )
@@ -87,6 +90,16 @@
   (default-to false (map-get? collaborator-exists {patent-id: patent-id, collaborator: user}))
 )
 
+(define-read-only (get-patent-expiry (patent-id uint))
+  (map-get? patent-renewals patent-id)
+)
+
+(define-read-only (is-patent-expired (patent-id uint))
+  (match (map-get? patent-renewals patent-id)
+    data (>= stacks-block-height (get expiry data))
+    false
+  )
+)
 (define-read-only (verify-patent-timestamp (patent-id uint) (claimed-timestamp uint))
   (match (get-patent-metadata patent-id)
     metadata (ok (is-eq (get filing-timestamp metadata) claimed-timestamp))
@@ -161,7 +174,8 @@
         (unwrap! (as-max-len? (append current-category-patents patent-id) u1000) ERR_TRANSFER_FAILED))
     )
     
-    (var-set patent-counter patent-id)
+(map-set patent-renewals patent-id {expiry: (+ current-timestamp DEFAULT_RENEWAL_TERM), renewals: u0})
+(var-set patent-counter patent-id)
     (ok patent-id)
   )
 )
@@ -286,6 +300,7 @@
     (asserts! (is-eq tx-sender sender) ERR_NOT_AUTHORIZED)
     (asserts! (is-eq sender owner) ERR_NOT_AUTHORIZED)
     (asserts! (not (is-eq sender recipient)) ERR_INVALID_INPUT)
+    (asserts! (not (is-patent-expired patent-id)) ERR_EXPIRED)
     
     (try! (nft-transfer? patent-nft patent-id sender recipient))
     (map-set patent-ownership patent-id recipient)
@@ -315,6 +330,7 @@
   )
     (asserts! (> (len terms) u0) ERR_INVALID_INPUT)
     (asserts! (> duration u0) ERR_INVALID_INPUT)
+    (asserts! (not (is-patent-expired patent-id)) ERR_EXPIRED)
     
     (if has-collaborators
       (let ((vote-data (get-collaboration-vote patent-id)))
@@ -357,6 +373,19 @@
   )
 )
 
+(define-public (renew-patent (patent-id uint) (extra-duration uint))
+  (let (
+    (owner (unwrap! (unwrap! (get-owner patent-id) ERR_NOT_FOUND) ERR_NOT_FOUND))
+    (data (unwrap! (map-get? patent-renewals patent-id) ERR_NOT_FOUND))
+    (new-expiry (+ (get expiry data) extra-duration))
+  )
+    (asserts! (is-eq tx-sender owner) ERR_NOT_AUTHORIZED)
+    (asserts! (> extra-duration u0) ERR_INVALID_INPUT)
+    (map-set patent-renewals patent-id {expiry: new-expiry, renewals: (+ (get renewals data) u1)})
+    (ok true)
+  )
+)
+
 (define-public (set-contract-uri (uri (optional (string-utf8 256))))
   (begin
     (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
@@ -375,7 +404,7 @@
     )
       (ok {
         valid: (and 
-          (< blocks-elapsed u525600)
+          (not (is-patent-expired patent-id))
           (is-eq (get patent-status metadata) u"approved")
         ),
         filing-timestamp: filing-height,
